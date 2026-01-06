@@ -13,7 +13,7 @@ Create a parallel blog-style view for AdventureLog collections that presents tra
 ### Key Requirements
 1. **Keep existing AdventureLog UI** - Maintain current data management interface
 2. **Add new blog view** - Create public-facing story presentation
-3. **Paginated navigation** - Handle long trips (14 weeks) with day-by-day pagination
+3. **Paginated navigation** - Handle long trips (14 weeks) with day-by-day or post-by-post (where a post can contain multiple elements, such as locations, transportation, markdown note, etc) pagination
 4. **Smart navigation** - Remember viewer's last position, highlight new content
 5. **Full-width media** - Hero images and photo galleries for visual storytelling
 6. **Secret public URLs** - Shareable links not indexed by search engines
@@ -23,28 +23,251 @@ Create a parallel blog-style view for AdventureLog collections that presents tra
 
 ## 📐 Architecture Design
 
-### Option Selected: Hybrid Approach (Option 1 + Navigation Enhancements)
+### Option Selected: Post-Based View (Flexible Multi-Day Posts)
+
+#### Content Organization Philosophy
+
+**Post = Note + Related Content**
+- Each **Note** acts as a "blog post anchor"
+- Posts can span single or multiple days
+- Posts automatically include nearby Locations, Transportation, Lodging, Photos
+- Content within post can be in any order (mixed locations, notes, photos)
+
+**Example Post Structure:**
+```
+Post: "De eerste drie dagen in Granada"
+├── Date Range: Jan 3-5, 2026 (3 days)
+├── Hero Image: Alhambra sunset photo
+├── Main Content: Note with markdown storytelling
+├── Locations: Alhambra, Albaicín neighborhood, Mirador de San Nicolás
+├── Transportation: Car journey from Netherlands → Granada
+├── Photos: 15 images from these 3 days
+└── Lodging: Hotel Casa del Capitel Nazarí
+```
 
 #### New Routes Structure
 ```
-/share/[collection_id]              → Blog landing page with trip overview
-/share/[collection_id]/day/[number] → Individual day view (paginated)
-/share/[collection_id]/map          → Full trip map view
+/share/[collection_id]                → Blog landing page with trip overview
+/share/[collection_id]/post/[index]   → Individual post view (paginated by post, not day)
+/share/[collection_id]/map            → Full trip map view
 ```
+
+**Key Change:** Navigation is post-by-post, not day-by-day
+- A 14-week trip might have 20-30 posts (not 98 days)
+- Each post can tell a multi-day story
+- Posts are ordered by Note.date
 
 #### Component Hierarchy
 ```
 ShareLayout.svelte (wrapper for all blog views)
 ├── ShareHeader.svelte (trip title, date range, navigation)
-├── DayNavigator.svelte (pagination, progress bar, "new content" badges)
-├── DayView.svelte (main day content renderer)
+├── PostNavigator.svelte (pagination, progress bar, "new content" badges)
+├── PostView.svelte (main post content renderer - REPLACES DayView)
+│   ├── PostHeader.svelte (title, date range, intro)
 │   ├── HeroGallery.svelte (full-width photo display)
 │   ├── StoryContent.svelte (markdown notes rendered as blog posts)
-│   ├── LocationStoryCard.svelte (inline location with expanded details)
-│   ├── RouteMap.svelte (embedded map for the day's route)
-│   └── TransportationStory.svelte (journey details in narrative format)
+│   ├── MixedContentStream.svelte (NEW - renders locations, transport, notes in sequence)
+│   │   ├── LocationStoryCard.svelte (inline location with expanded details)
+│   │   ├── TransportationStory.svelte (journey details in narrative format)
+│   │   ├── PhotoGallery.svelte (photo grid sections)
+│   │   └── TextSection.svelte (additional markdown sections)
+│   ├── RouteMap.svelte (embedded map for the post's locations)
+│   └── PostFooter.svelte (date info, continue reading)
 └── ShareFooter.svelte (trip stats, social sharing)
 ```
+
+---
+
+## 🔧 Data Model & Post Construction
+
+### How "Posts" Work Without Backend Changes
+
+**Current AdventureLog Data Structure:**
+- **Collection**: Top-level container for a trip
+- **Notes**: Markdown content with title, date, images, links
+- **Locations**: Places visited (with Visit timestamps)
+- **Transportation**: Journeys between places (with date ranges)
+- **Lodging**: Accommodations (with check-in/check-out dates)
+- **Photos**: Attached to any of the above via GenericRelation
+
+**Blog View "Post" Concept:**
+- **Post = Virtual grouping** created in frontend from existing data
+- **Post Anchor = Note** (one Note becomes one Post)
+- **Post Boundaries = Date range** derived from Note.date ± related content dates
+
+### Post Construction Algorithm
+
+```typescript
+interface Post {
+  id: string;
+  title: string;              // From Note.name
+  content: string;            // From Note.content (markdown)
+  startDate: Date;           // From Note.date (or earliest related content date)
+  endDate: Date;             // From latest related content date
+  heroImage: Image | null;   // From Note.images[0] or first location image
+  items: ContentItem[];      // Mixed array of locations, transport, etc.
+}
+
+function buildPostsFromCollection(collection: Collection): Post[] {
+  // 1. Start with all Notes (sorted by date)
+  const notes = collection.notes.sort((a, b) => a.date - b.date);
+
+  // 2. For each Note, gather related content
+  return notes.map((note, index) => {
+    const prevNoteDate = notes[index - 1]?.date;
+    const nextNoteDate = notes[index + 1]?.date;
+
+    // Define date range for this post
+    const startDate = note.date;
+    const endDate = nextNoteDate
+      ? new Date(nextNoteDate.getTime() - 1) // Up to day before next note
+      : addDays(note.date, 3); // Or default ±3 days
+
+    // Gather all content within date range
+    const locations = collection.locations.filter(loc =>
+      loc.visits.some(v => isWithinDateRange(v.start_date, startDate, endDate))
+    );
+
+    const transportation = collection.transportations.filter(t =>
+      isWithinDateRange(t.date, startDate, endDate) ||
+      isWithinDateRange(t.end_date, startDate, endDate)
+    );
+
+    const lodging = collection.lodging.filter(l =>
+      dateRangesOverlap(l.check_in, l.check_out, startDate, endDate)
+    );
+
+    // Gather all photos from these items
+    const allPhotos = [
+      ...note.images,
+      ...locations.flatMap(l => l.images),
+      ...transportation.flatMap(t => t.images),
+      ...lodging.flatMap(l => l.images)
+    ];
+
+    // Build mixed content stream (ordered by date/time)
+    const items = [
+      ...locations.map(l => ({ type: 'location', data: l, date: l.visits[0].start_date })),
+      ...transportation.map(t => ({ type: 'transport', data: t, date: t.date })),
+      ...lodging.map(l => ({ type: 'lodging', data: l, date: l.check_in })),
+    ].sort((a, b) => a.date - b.date);
+
+    return {
+      id: note.id,
+      title: note.name,
+      content: note.content,
+      startDate,
+      endDate,
+      heroImage: allPhotos[0] || null,
+      items,
+      allPhotos
+    };
+  });
+}
+```
+
+### Post Date Range Strategies
+
+**Strategy 1: Fixed Window (Simple)**
+- Each post covers Note.date ± N days (e.g., ± 1 day)
+- Works well for daily posting
+
+**Strategy 2: Until Next Note (Adaptive)**
+- Post spans from Note.date until day before next Note.date
+- Allows flexible multi-day posts
+- **Recommended for your use case**
+
+**Strategy 3: Explicit Date Range (Advanced - Future)**
+- Allow user to specify date range in Note metadata
+- Example: Add custom field or parse from Note content
+  ```markdown
+  <!-- date-range: 2026-01-03 to 2026-01-05 -->
+  ```
+
+### Content Ordering Within Post
+
+**Initial Implementation:**
+- Order by date/time (chronological within post)
+- Locations → sorted by Visit.start_date
+- Transportation → sorted by date
+- Lodging → sorted by check_in
+
+**Future Enhancement:**
+- Add `order` field to backend models
+- Allow drag-and-drop reordering in AdventureLog UI
+- Blog view respects manual ordering
+
+### Multi-Day Post Example
+
+**Scenario:** 3-day Granada visit
+
+**User Creates:**
+```
+Note (Jan 4):
+  Title: "Three Days in Granada: Alhambra and Beyond"
+  Content: "Our Granada adventure started with a long drive from
+            the Netherlands. Day 1 was all about settling in and
+            exploring the Albaicín neighborhood. Day 2 we finally
+            visited the Alhambra - absolutely breathtaking! Day 3
+            was more relaxed with tapas and viewpoints..."
+  Date: 2026-01-04
+
+Locations:
+  - Alhambra (Visit: Jan 5, 10am-2pm)
+  - Albaicín (Visit: Jan 4, 3pm-7pm)
+  - Mirador de San Nicolás (Visit: Jan 6, 5pm-7pm)
+
+Transportation:
+  - Car (Jan 2-4: Netherlands → Granada, 1746 km)
+
+Lodging:
+  - Hotel Casa del Capitel (Check-in: Jan 4, Check-out: Jan 7)
+```
+
+**Blog View Displays:**
+```
+Post: "Three Days in Granada: Alhambra and Beyond"
+Date Range: Jan 4-6, 2026 (3 days)
+
+[Hero Image: Alhambra photo]
+
+## Main Story
+[Full markdown content from Note - tells 3-day narrative]
+
+## Our Journey
+🚗 Car - Netherlands to Granada
+1,746 km | Jan 2-4
+
+## What We Saw
+📍 Albaicín neighborhood
+⭐⭐⭐⭐⭐ | Visited Jan 4
+
+[Photo gallery from Albaicín]
+
+📍 Alhambra
+⭐⭐⭐⭐⭐ | Visited Jan 5
+
+[Photo gallery from Alhambra]
+
+📍 Mirador de San Nicolás
+⭐⭐⭐⭐⭐ | Visited Jan 6
+
+[Photo gallery from viewpoint]
+
+## Where We Stayed
+🏨 Hotel Casa del Capitel Nazarí
+⭐⭐⭐⭐ | Jan 4-7
+
+[Map showing all locations]
+```
+
+### Benefits of This Approach
+
+✅ **No backend changes needed** - Works with existing data model
+✅ **Flexible post length** - Can be 1 day or many days
+✅ **Natural authoring** - Write Notes as you go, blog view groups automatically
+✅ **Mixed content** - Locations, transport, lodging all in one post
+✅ **Easy migration path** - Can add explicit Post model later if needed
 
 ---
 
