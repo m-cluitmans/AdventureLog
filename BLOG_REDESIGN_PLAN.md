@@ -80,7 +80,7 @@ ShareLayout.svelte (wrapper for all blog views)
 
 ## 🔧 Data Model & Post Construction
 
-### How "Posts" Work Without Backend Changes
+### Post = Ordered Collection of Mixed Content
 
 **Current AdventureLog Data Structure:**
 - **Collection**: Top-level container for a trip
@@ -91,183 +91,350 @@ ShareLayout.svelte (wrapper for all blog views)
 - **Photos**: Attached to any of the above via GenericRelation
 
 **Blog View "Post" Concept:**
-- **Post = Virtual grouping** created in frontend from existing data
-- **Post Anchor = Note** (one Note becomes one Post)
-- **Post Boundaries = Date range** derived from Note.date ± related content dates
+- **Post = Ordered sequence** of Notes, Locations, Transportation, Lodging, Photos
+- **Post Boundaries = Date range** that groups related content
+- **Content Order = Manual** via `order` field (with chronological fallback)
+- **Post Anchor = First Note** in the sequence (provides title and hero image)
+
+### Backend Extension Required
+
+**New Field: `order`**
+Add an integer `order` field to all content models to enable manual sequencing:
+
+```python
+# backend/server/adventures/models.py
+
+class Note(models.Model):
+    # ... existing fields ...
+    order = models.IntegerField(null=True, blank=True, default=None,
+                                help_text="Order within collection for blog view")
+
+class Visit(models.Model):  # For locations
+    # ... existing fields ...
+    order = models.IntegerField(null=True, blank=True, default=None,
+                                help_text="Order within collection for blog view")
+
+class Transportation(models.Model):
+    # ... existing fields ...
+    order = models.IntegerField(null=True, blank=True, default=None,
+                                help_text="Order within collection for blog view")
+
+class Lodging(models.Model):
+    # ... existing fields ...
+    order = models.IntegerField(null=True, blank=True, default=None,
+                                help_text="Order within collection for blog view")
+
+class Checklist(models.Model):
+    # ... existing fields ...
+    order = models.IntegerField(null=True, blank=True, default=None,
+                                help_text="Order within collection for blog view")
+```
+
+**Migration:**
+```bash
+python manage.py makemigrations adventures
+python manage.py migrate
+```
+
+**Serializers Update:**
+```python
+# backend/server/adventures/serializers.py
+
+class NoteSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Note
+        fields = ['id', 'user', 'name', 'content', 'date', 'links',
+                 'is_public', 'collection', 'created_at', 'updated_at', 'order']
+
+# Similar updates for Transportation, Visit, Lodging, Checklist serializers
+```
 
 ### Post Construction Algorithm
 
 ```typescript
+interface ContentItem {
+  type: 'note' | 'location' | 'transportation' | 'lodging' | 'checklist';
+  data: Note | Location | Transportation | Lodging | Checklist;
+  order: number | null;
+  date: Date;
+}
+
 interface Post {
   id: string;
-  title: string;              // From Note.name
-  content: string;            // From Note.content (markdown)
-  startDate: Date;           // From Note.date (or earliest related content date)
-  endDate: Date;             // From latest related content date
-  heroImage: Image | null;   // From Note.images[0] or first location image
-  items: ContentItem[];      // Mixed array of locations, transport, etc.
+  title: string;              // From first Note in post
+  startDate: Date;           // From earliest content date
+  endDate: Date;             // From latest content date
+  heroImage: Image | null;   // From first Note's images or first location image
+  items: ContentItem[];      // Ordered array of all content (notes, locations, etc.)
 }
 
 function buildPostsFromCollection(collection: Collection): Post[] {
-  // 1. Start with all Notes (sorted by date)
-  const notes = collection.notes.sort((a, b) => a.date - b.date);
+  // 1. Gather all content items with order field
+  const allItems: ContentItem[] = [
+    ...collection.notes.map(n => ({
+      type: 'note' as const,
+      data: n,
+      order: n.order,
+      date: n.date
+    })),
+    ...collection.locations.flatMap(loc =>
+      loc.visits.map(v => ({
+        type: 'location' as const,
+        data: { ...loc, visit: v },  // Include visit timestamp
+        order: v.order,
+        date: v.start_date
+      }))
+    ),
+    ...collection.transportations.map(t => ({
+      type: 'transportation' as const,
+      data: t,
+      order: t.order,
+      date: t.date
+    })),
+    ...collection.lodging.map(l => ({
+      type: 'lodging' as const,
+      data: l,
+      order: l.order,
+      date: l.check_in
+    })),
+    ...collection.checklists.map(c => ({
+      type: 'checklist' as const,
+      data: c,
+      order: c.order,
+      date: c.date
+    }))
+  ];
 
-  // 2. For each Note, gather related content
-  return notes.map((note, index) => {
-    const prevNoteDate = notes[index - 1]?.date;
-    const nextNoteDate = notes[index + 1]?.date;
-
-    // Define date range for this post
-    const startDate = note.date;
-    const endDate = nextNoteDate
-      ? new Date(nextNoteDate.getTime() - 1) // Up to day before next note
-      : addDays(note.date, 3); // Or default ±3 days
-
-    // Gather all content within date range
-    const locations = collection.locations.filter(loc =>
-      loc.visits.some(v => isWithinDateRange(v.start_date, startDate, endDate))
-    );
-
-    const transportation = collection.transportations.filter(t =>
-      isWithinDateRange(t.date, startDate, endDate) ||
-      isWithinDateRange(t.end_date, startDate, endDate)
-    );
-
-    const lodging = collection.lodging.filter(l =>
-      dateRangesOverlap(l.check_in, l.check_out, startDate, endDate)
-    );
-
-    // Gather all photos from these items
-    const allPhotos = [
-      ...note.images,
-      ...locations.flatMap(l => l.images),
-      ...transportation.flatMap(t => t.images),
-      ...lodging.flatMap(l => l.images)
-    ];
-
-    // Build mixed content stream (ordered by date/time)
-    const items = [
-      ...locations.map(l => ({ type: 'location', data: l, date: l.visits[0].start_date })),
-      ...transportation.map(t => ({ type: 'transport', data: t, date: t.date })),
-      ...lodging.map(l => ({ type: 'lodging', data: l, date: l.check_in })),
-    ].sort((a, b) => a.date - b.date);
-
-    return {
-      id: note.id,
-      title: note.name,
-      content: note.content,
-      startDate,
-      endDate,
-      heroImage: allPhotos[0] || null,
-      items,
-      allPhotos
-    };
+  // 2. Sort by order (if set), then by date
+  allItems.sort((a, b) => {
+    // If both have order, sort by order
+    if (a.order !== null && b.order !== null) {
+      return a.order - b.order;
+    }
+    // If only one has order, prioritize it
+    if (a.order !== null) return -1;
+    if (b.order !== null) return 1;
+    // If neither has order, sort by date
+    return a.date.getTime() - b.date.getTime();
   });
+
+  // 3. Group items into posts based on date proximity or explicit ordering
+  const posts: Post[] = [];
+  let currentPost: ContentItem[] = [];
+  let currentPostStartDate: Date | null = null;
+
+  allItems.forEach((item, index) => {
+    const nextItem = allItems[index + 1];
+
+    if (!currentPostStartDate) {
+      currentPostStartDate = item.date;
+    }
+
+    currentPost.push(item);
+
+    // Determine if this ends the current post:
+    // 1. Next item is a Note (Notes start new posts)
+    // 2. Gap of 2+ days to next item
+    // 3. This is the last item
+    const isNextNote = nextItem?.type === 'note';
+    const dayGap = nextItem
+      ? Math.abs(daysBetween(item.date, nextItem.date))
+      : Infinity;
+    const isLastItem = !nextItem;
+
+    if (isNextNote || dayGap >= 2 || isLastItem) {
+      // Find first note in post for title
+      const firstNote = currentPost.find(i => i.type === 'note');
+
+      if (firstNote) {  // Only create post if it has at least one Note
+        const postDates = currentPost.map(i => i.date);
+        const startDate = new Date(Math.min(...postDates.map(d => d.getTime())));
+        const endDate = new Date(Math.max(...postDates.map(d => d.getTime())));
+
+        // Gather all photos from post items
+        const allPhotos = currentPost.flatMap(item => {
+          if (item.data.images) return item.data.images;
+          if (item.data.attachments) return item.data.attachments;
+          return [];
+        });
+
+        posts.push({
+          id: firstNote.data.id,
+          title: (firstNote.data as Note).name,
+          startDate,
+          endDate,
+          heroImage: allPhotos[0] || null,
+          items: currentPost
+        });
+      }
+
+      currentPost = [];
+      currentPostStartDate = null;
+    }
+  });
+
+  return posts;
 }
 ```
 
-### Post Date Range Strategies
+### Post Grouping Logic
 
-**Strategy 1: Fixed Window (Simple)**
-- Each post covers Note.date ± N days (e.g., ± 1 day)
-- Works well for daily posting
+**How Content Gets Grouped into Posts:**
 
-**Strategy 2: Until Next Note (Adaptive)**
-- Post spans from Note.date until day before next Note.date
-- Allows flexible multi-day posts
-- **Recommended for your use case**
+1. **Notes trigger new posts** - Each Note starts a new blog post
+2. **Content follows until next Note** - All Locations, Transportation, Lodging between Notes belong to the post
+3. **Date proximity groups orphans** - Content without nearby Notes groups by 2-day gaps
+4. **Manual ordering overrides** - Setting `order` field explicitly sequences content
 
-**Strategy 3: Explicit Date Range (Advanced - Future)**
-- Allow user to specify date range in Note metadata
-- Example: Add custom field or parse from Note content
-  ```markdown
-  <!-- date-range: 2026-01-03 to 2026-01-05 -->
-  ```
+**Example Timeline:**
+```
+Order: 1  | Note 1 (Jan 4): "Arrival in Granada"     ← Post 1 starts
+Order: 2  | Location (Jan 4): Albaicín neighborhood  ← Part of Post 1
+Order: 3  | Note 2 (Jan 4): "Evening walk"           ← Still Post 1 (same day)
+Order: 4  | Location (Jan 5): Alhambra               ← Part of Post 1
+Order: 5  | Transportation (Jan 5): Train            ← Part of Post 1
+Order: 10 | Note 3 (Jan 7): "Day trip"               ← Post 2 starts (new Note)
+Order: 11 | Location (Jan 7): Sierra Nevada          ← Part of Post 2
+```
 
-### Content Ordering Within Post
+### Content Ordering Within Posts
 
-**Initial Implementation:**
-- Order by date/time (chronological within post)
-- Locations → sorted by Visit.start_date
-- Transportation → sorted by date
-- Lodging → sorted by check_in
+**Ordering Priority:**
+1. **Manual `order` field** (if set) - User has explicitly sequenced
+2. **Chronological by date** (fallback) - Natural time order
+3. **Type-based** (last resort) - Notes → Locations → Transportation → Lodging
 
-**Future Enhancement:**
-- Add `order` field to backend models
-- Allow drag-and-drop reordering in AdventureLog UI
-- Blog view respects manual ordering
+**Setting Order:**
+- Initially: `order` is `null` for all items → chronological sorting
+- User can drag-and-drop in AdventureLog UI to set explicit order
+- Order values can have gaps (10, 20, 30...) to allow easy insertion
 
 ### Multi-Day Post Example
 
-**Scenario:** 3-day Granada visit
+**Scenario:** 3-day Granada visit with flexible content ordering
 
-**User Creates:**
+**User Creates in AdventureLog:**
 ```
-Note (Jan 4):
-  Title: "Three Days in Granada: Alhambra and Beyond"
-  Content: "Our Granada adventure started with a long drive from
-            the Netherlands. Day 1 was all about settling in and
-            exploring the Albaicín neighborhood. Day 2 we finally
-            visited the Alhambra - absolutely breathtaking! Day 3
-            was more relaxed with tapas and viewpoints..."
+Note 1 (Jan 4):
+  Title: "Three Days in Granada"
+  Content: "Our Granada adventure started with a long drive from the Netherlands..."
   Date: 2026-01-04
+  Order: 1
 
-Locations:
-  - Alhambra (Visit: Jan 5, 10am-2pm)
-  - Albaicín (Visit: Jan 4, 3pm-7pm)
-  - Mirador de San Nicolás (Visit: Jan 6, 5pm-7pm)
+Transportation (Jan 2-4):
+  Type: Car
+  From: Netherlands → Granada
+  Distance: 1,746 km
+  Order: 2  ← User dragged this to appear after first note
 
-Transportation:
-  - Car (Jan 2-4: Netherlands → Granada, 1746 km)
+Note 2 (Jan 4):
+  Title: "Exploring Albaicín"
+  Content: "First evening we wandered through the narrow streets..."
+  Date: 2026-01-04
+  Order: 3
 
-Lodging:
-  - Hotel Casa del Capitel (Check-in: Jan 4, Check-out: Jan 7)
+Location (Jan 4):
+  Name: Albaicín neighborhood
+  Visit: Jan 4, 3pm-7pm
+  Order: 4  ← Appears after the note about Albaicín
+
+Note 3 (Jan 5):
+  Title: "The Alhambra"
+  Content: "Day 2 we finally visited the palace. It was stunning!"
+  Date: 2026-01-05
+  Order: 5
+
+Location (Jan 5):
+  Name: Alhambra
+  Visit: Jan 5, 10am-2pm
+  Order: 6
+
+Note 4 (Jan 6):
+  Title: "Sunset Viewpoints"
+  Content: "Last day was more relaxed with sunset at Mirador..."
+  Date: 2026-01-06
+  Order: 7
+
+Location (Jan 6):
+  Name: Mirador de San Nicolás
+  Visit: Jan 6, 5pm-7pm
+  Order: 8
+
+Lodging (Jan 4-7):
+  Name: Hotel Casa del Capitel Nazarí
+  Check-in: Jan 4
+  Order: null  ← No explicit order, appears at end
 ```
 
 **Blog View Displays:**
 ```
-Post: "Three Days in Granada: Alhambra and Beyond"
+Post: "Three Days in Granada"
 Date Range: Jan 4-6, 2026 (3 days)
 
 [Hero Image: Alhambra photo]
 
-## Main Story
-[Full markdown content from Note - tells 3-day narrative]
+---
 
-## Our Journey
+## Three Days in Granada
+Our Granada adventure started with a long drive from the Netherlands...
+
 🚗 Car - Netherlands to Granada
 1,746 km | Jan 2-4
+[Photos from journey]
 
-## What We Saw
+---
+
+## Exploring Albaicín
+First evening we wandered through the narrow streets...
+
 📍 Albaicín neighborhood
 ⭐⭐⭐⭐⭐ | Visited Jan 4
-
 [Photo gallery from Albaicín]
+
+---
+
+## The Alhambra
+Day 2 we finally visited the palace. It was stunning!
 
 📍 Alhambra
 ⭐⭐⭐⭐⭐ | Visited Jan 5
-
 [Photo gallery from Alhambra]
+
+---
+
+## Sunset Viewpoints
+Last day was more relaxed with sunset at Mirador...
 
 📍 Mirador de San Nicolás
 ⭐⭐⭐⭐⭐ | Visited Jan 6
-
 [Photo gallery from viewpoint]
 
-## Where We Stayed
+---
+
 🏨 Hotel Casa del Capitel Nazarí
 ⭐⭐⭐⭐ | Jan 4-7
+[Lodging photos]
 
 [Map showing all locations]
 ```
 
+**Key Points:**
+- Multiple Notes within same post create sections
+- Content interleaved based on `order` field
+- Transportation appears after relevant note (not at end)
+- Natural narrative flow with text → photos → text → photos
+- Lodging without order appears at end
+
 ### Benefits of This Approach
 
-✅ **No backend changes needed** - Works with existing data model
+✅ **Full manual control** - Drag-and-drop any content in any order
 ✅ **Flexible post length** - Can be 1 day or many days
-✅ **Natural authoring** - Write Notes as you go, blog view groups automatically
-✅ **Mixed content** - Locations, transport, lodging all in one post
-✅ **Easy migration path** - Can add explicit Post model later if needed
+✅ **Natural authoring** - Write Notes as you go, content groups automatically
+✅ **Mixed content** - Interleave notes, locations, photos, transportation
+✅ **Blog-like flow** - Text → photo → text → map → text (any sequence)
+✅ **Chronological fallback** - Works without setting order (uses dates)
+✅ **Minimal backend change** - Just one integer field per model
+✅ **Future-proof** - Can extend with post templates, auto-ordering, etc.
 
 ---
 
@@ -484,15 +651,42 @@ const hasNewDays = totalDays > parseInt(lastKnownTotalDays || '0')
 
 ## 🛠️ Technical Implementation Plan
 
-### Phase 1: Core Blog View Foundation (Week 1)
-**Goal:** Create basic shareable blog view with single-day display
+### Phase 0: Backend Extension (Days 1-2)
+**Goal:** Add `order` field to enable manual content sequencing
+
+#### Tasks:
+1. **Add order field to models**
+   - Update `Note`, `Visit`, `Transportation`, `Lodging`, `Checklist` models
+   - Add `order = IntegerField(null=True, blank=True, default=None)`
+   - Create and run migrations
+
+2. **Update serializers**
+   - Add `order` field to all content serializers
+   - Ensure API returns order field
+
+3. **Add batch update endpoint**
+   - Create `PATCH /api/collections/{id}/reorder/` endpoint
+   - Accept array of `{type, id, order}` objects
+   - Update order for multiple items at once
+
+4. **Test backend changes**
+   - Verify migrations work
+   - Test order field in API responses
+   - Test batch update endpoint
+
+**Deliverable:** Backend supports order field, API returns it
+
+---
+
+### Phase 1: Core Blog View Foundation (Days 3-5)
+**Goal:** Create basic shareable blog view with post-based display
 
 #### Tasks:
 1. **Create new route structure**
    - `src/routes/share/[id]/+page.svelte` - Landing page
    - `src/routes/share/[id]/+page.server.ts` - Data loading
-   - `src/routes/share/[id]/day/[number]/+page.svelte` - Day view
-   - `src/routes/share/[id]/day/[number]/+page.server.ts` - Day data loading
+   - `src/routes/share/[id]/post/[index]/+page.svelte` - Post view
+   - `src/routes/share/[id]/post/[index]/+page.server.ts` - Post data loading
 
 2. **Build core components**
    - `ShareLayout.svelte` - Wrapper with header/footer
@@ -631,7 +825,72 @@ const hasNewDays = totalDays > parseInt(lastKnownTotalDays || '0')
 
 ---
 
-### Phase 5: Future Enhancements (Optional)
+### Phase 5: Drag-and-Drop Ordering UI (Optional - Week 3-4)
+**Goal:** Add visual interface for manually ordering content
+
+#### Tasks:
+1. **Create ordering modal in collection view**
+   - Add "Reorder for Blog" button in existing collection page header
+   - Modal shows all collection content in list format
+   - Group by date initially, show current order values
+
+2. **Implement drag-and-drop**
+   - Use library like `@dnd-kit/core` or `svelte-dnd-action`
+   - Drag handles on each item
+   - Visual feedback during drag (ghost, placeholder)
+   - Auto-scroll when dragging to edges
+
+3. **Order management logic**
+   - Calculate new order values on drop (use gaps: 10, 20, 30...)
+   - Batch update API call on "Save"
+   - Optimistic UI updates
+   - Undo/reset functionality
+
+4. **Visual indicators**
+   - Show items with explicit order (numbered badges)
+   - Show items without order (date-based)
+   - Highlight "post boundaries" (first Note = new post)
+   - Preview mode: "View as Blog" button
+
+5. **Mobile-friendly ordering**
+   - Touch support for drag-and-drop
+   - Alternative: Up/Down buttons for mobile
+   - Numbered list view as fallback
+
+**Deliverable:** Full drag-and-drop interface for content ordering
+
+**Example UI:**
+```
+┌────────────────────────────────────────┐
+│  Reorder Content for Blog View         │
+│  [Preview Blog] [Reset] [Save]         │
+├────────────────────────────────────────┤
+│  ☰ [1] Note: "Arrival in Granada"     │ ← Drag handle
+│     Jan 4, 2026                        │
+│                                        │
+│  ☰ [2] Transport: Car (NL → Granada)  │
+│     Jan 2-4, 2026                      │
+│                                        │
+│  ☰ [3] Note: "Exploring Albaicín"     │
+│     Jan 4, 2026                        │
+│                                        │
+│  ☰ [4] Location: Albaicín              │
+│     Visited Jan 4, 2026                │
+│                                        │
+│  ☰ [5] Note: "The Alhambra"            │ ← New post starts here
+│     Jan 5, 2026 [NEW POST BOUNDARY]   │
+│                                        │
+│  ☰ [6] Location: Alhambra              │
+│     Visited Jan 5, 2026                │
+│                                        │
+│  📅 Lodging: Hotel (no order)          │ ← No drag handle (auto-ordered)
+│     Jan 4-7, 2026                      │
+└────────────────────────────────────────┘
+```
+
+---
+
+### Phase 6: Future Enhancements (Optional)
 **Goal:** Advanced features for enhanced storytelling
 
 #### Potential Additions:
