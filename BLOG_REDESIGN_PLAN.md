@@ -23,351 +23,416 @@ Create a parallel blog-style view for AdventureLog collections that presents tra
 
 ## 📐 Architecture Design
 
-### Option Selected: Post-Based View (Flexible Multi-Day Posts)
+### Explicit Post Model (First-Class Entities)
 
 #### Content Organization Philosophy
 
-**Post = Note + Related Content**
-- Each **Note** acts as a "blog post anchor"
-- Posts can span single or multiple days
-- Posts automatically include nearby Locations, Transportation, Lodging, Photos
-- Content within post can be in any order (mixed locations, notes, photos)
+**Post = First-Class Entity**
+- **Post** is a database model (not virtual grouping)
+- Each Post has: title, date range, hero image, published status
+- Posts explicitly link to content items (Notes, Locations, Transportation, etc.)
+- Content items can belong to multiple posts or none
+- Content order within post is explicit (via `order` field)
 
-**Example Post Structure:**
+**Collection = Trip/Sabbatical**
+- Collection contains multiple Posts
+- Collection has overall date range
+- Share URL shows all posts in trip: `/share/{collection-id}`
+
+**Example Structure:**
 ```
-Post: "De eerste drie dagen in Granada"
-├── Date Range: Jan 3-5, 2026 (3 days)
-├── Hero Image: Alhambra sunset photo
-├── Main Content: Note with markdown storytelling
-├── Locations: Alhambra, Albaicín neighborhood, Mirador de San Nicolás
-├── Transportation: Car journey from Netherlands → Granada
-├── Photos: 15 images from these 3 days
-└── Lodging: Hotel Casa del Capitel Nazarí
+Collection: "Sabbatical 2026" (Jan 2 - June 15, 2026)
+├── Post 1: "Arrival in Granada" (Jan 4-6)
+│   ├── [Order 1] Note: "Three Days in Granada"
+│   ├── [Order 2] Transportation: Car journey
+│   ├── [Order 3] Note: "Exploring Albaicín"
+│   ├── [Order 4] Location: Albaicín neighborhood
+│   ├── [Order 5] Note: "The Alhambra"
+│   ├── [Order 6] Location: Alhambra
+│   └── [Order 7] Location: Mirador de San Nicolás
+├── Post 2: "Day Trip to Sierra Nevada" (Jan 7)
+│   ├── [Order 1] Note: "Mountain adventure"
+│   ├── [Order 2] Transportation: Car
+│   └── [Order 3] Location: Sierra Nevada
+└── Post 3: "Coastal Route" (Jan 8-10)
+    ├── [Order 1] Note: "Driving along the coast"
+    ├── [Order 2] Transportation: Car
+    ├── [Order 3] Location: Málaga
+    └── [Order 4] Location: Nerja
 ```
 
 #### New Routes Structure
 ```
-/share/[collection_id]                → Blog landing page with trip overview
-/share/[collection_id]/post/[index]   → Individual post view (paginated by post, not day)
-/share/[collection_id]/map            → Full trip map view
+/share/[collection_id]                    → Trip overview (lists all posts)
+/share/[collection_id]/[post_slug]        → Individual post view
+/share/[collection_id]/map                → Full trip map view
 ```
 
-**Key Change:** Navigation is post-by-post, not day-by-day
-- A 14-week trip might have 20-30 posts (not 98 days)
-- Each post can tell a multi-day story
-- Posts are ordered by Note.date
+**Navigation:**
+- Trip overview shows all posts with preview
+- Post navigation: Previous/Next post buttons
+- Progress indicator: "Post 3 of 25"
+- Remember last viewed post (localStorage)
 
 #### Component Hierarchy
 ```
 ShareLayout.svelte (wrapper for all blog views)
 ├── ShareHeader.svelte (trip title, date range, navigation)
+├── TripOverview.svelte (NEW - landing page showing all posts)
+│   └── PostPreviewCard.svelte (post card with title, date, hero image)
 ├── PostNavigator.svelte (pagination, progress bar, "new content" badges)
-├── PostView.svelte (main post content renderer - REPLACES DayView)
-│   ├── PostHeader.svelte (title, date range, intro)
+├── PostView.svelte (main post content renderer)
+│   ├── PostHeader.svelte (title, date range)
 │   ├── HeroGallery.svelte (full-width photo display)
-│   ├── StoryContent.svelte (markdown notes rendered as blog posts)
-│   ├── MixedContentStream.svelte (NEW - renders locations, transport, notes in sequence)
-│   │   ├── LocationStoryCard.svelte (inline location with expanded details)
-│   │   ├── TransportationStory.svelte (journey details in narrative format)
-│   │   ├── PhotoGallery.svelte (photo grid sections)
-│   │   └── TextSection.svelte (additional markdown sections)
-│   ├── RouteMap.svelte (embedded map for the post's locations)
-│   └── PostFooter.svelte (date info, continue reading)
+│   ├── MixedContentStream.svelte (renders all post items in order)
+│   │   ├── NoteSection.svelte (markdown note)
+│   │   ├── LocationStoryCard.svelte (location with details)
+│   │   ├── TransportationStory.svelte (journey details)
+│   │   ├── PhotoGallery.svelte (photo grid)
+│   │   ├── LodgingCard.svelte (accommodation details)
+│   │   └── ChecklistDisplay.svelte (checklist items)
+│   ├── RouteMap.svelte (embedded map for post locations)
+│   └── PostFooter.svelte (prev/next post navigation)
 └── ShareFooter.svelte (trip stats, social sharing)
 ```
 
 ---
 
-## 🔧 Data Model & Post Construction
+## 🔧 Data Model & Backend Changes
 
-### Post = Ordered Collection of Mixed Content
+### New Models Required
 
-**Current AdventureLog Data Structure:**
-- **Collection**: Top-level container for a trip
-- **Notes**: Markdown content with title, date, images, links
-- **Locations**: Places visited (with Visit timestamps)
-- **Transportation**: Journeys between places (with date ranges)
-- **Lodging**: Accommodations (with check-in/check-out dates)
-- **Photos**: Attached to any of the above via GenericRelation
-
-**Blog View "Post" Concept:**
-- **Post = Ordered sequence** of Notes, Locations, Transportation, Lodging, Photos
-- **Post Boundaries = Date range** that groups related content
-- **Content Order = Manual** via `order` field (with chronological fallback)
-- **Post Anchor = First Note** in the sequence (provides title and hero image)
-
-### Backend Extension Required
-
-**New Field: `order`**
-Add an integer `order` field to all content models to enable manual sequencing:
-
+**1. Post Model**
 ```python
 # backend/server/adventures/models.py
 
+class Post(models.Model):
+    """A blog post within a collection (trip)"""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    collection = models.ForeignKey(Collection, on_delete=models.CASCADE,
+                                   related_name='posts')
+    user = models.ForeignKey(User, on_delete=models.CASCADE)
+
+    # Post metadata
+    title = models.CharField(max_length=200)
+    slug = models.SlugField(max_length=200, blank=True)  # For nice URLs
+    start_date = models.DateField()
+    end_date = models.DateField(null=True, blank=True)  # Can be same as start_date
+
+    # Display settings
+    hero_image = models.ForeignKey('ContentImage', null=True, blank=True,
+                                   on_delete=models.SET_NULL,
+                                   related_name='post_hero')
+    is_published = models.BooleanField(default=False)  # Draft vs. published
+    order = models.IntegerField()  # Order within collection (1, 2, 3...)
+
+    # Timestamps
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['collection', 'order']
+        unique_together = [['collection', 'slug']]
+        indexes = [
+            models.Index(fields=['collection', 'order']),
+            models.Index(fields=['collection', 'is_published']),
+        ]
+
+    def save(self, *args, **kwargs):
+        if not self.slug:
+            self.slug = slugify(self.title)
+        super().save(*args, **kwargs)
+```
+
+**2. PostItem Model (Links content to posts)**
+```python
+class PostItem(models.Model):
+    """Many-to-many relationship between Post and content items with ordering"""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    post = models.ForeignKey(Post, on_delete=models.CASCADE, related_name='items')
+
+    # Polymorphic content reference (can link to any content type)
+    content_type = models.ForeignKey(ContentType, on_delete=models.CASCADE)
+    object_id = models.UUIDField()
+    content_object = GenericForeignKey('content_type', 'object_id')
+
+    # Order within post
+    order = models.IntegerField()
+
+    # Timestamps
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['post', 'order']
+        unique_together = [['post', 'content_type', 'object_id']]
+        indexes = [
+            models.Index(fields=['post', 'order']),
+        ]
+```
+
+**3. Update existing models to add reverse relations**
+```python
+from django.contrib.contenttypes.fields import GenericRelation
+
 class Note(models.Model):
     # ... existing fields ...
-    order = models.IntegerField(null=True, blank=True, default=None,
-                                help_text="Order within collection for blog view")
+    post_items = GenericRelation('PostItem')
 
-class Visit(models.Model):  # For locations
+class Visit(models.Model):
     # ... existing fields ...
-    order = models.IntegerField(null=True, blank=True, default=None,
-                                help_text="Order within collection for blog view")
+    post_items = GenericRelation('PostItem')
 
 class Transportation(models.Model):
     # ... existing fields ...
-    order = models.IntegerField(null=True, blank=True, default=None,
-                                help_text="Order within collection for blog view")
+    post_items = GenericRelation('PostItem')
 
 class Lodging(models.Model):
     # ... existing fields ...
-    order = models.IntegerField(null=True, blank=True, default=None,
-                                help_text="Order within collection for blog view")
+    post_items = GenericRelation('PostItem')
 
 class Checklist(models.Model):
     # ... existing fields ...
-    order = models.IntegerField(null=True, blank=True, default=None,
-                                help_text="Order within collection for blog view")
+    post_items = GenericRelation('PostItem')
 ```
 
-**Migration:**
+### Migrations
+
 ```bash
+# Create migrations
 python manage.py makemigrations adventures
-python manage.py migrate
+
+# Apply migrations
+python manage.py migrate adventures
 ```
 
-**Serializers Update:**
+### API Serializers
+
+**Post Serializer:**
 ```python
 # backend/server/adventures/serializers.py
 
-class NoteSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = Note
-        fields = ['id', 'user', 'name', 'content', 'date', 'links',
-                 'is_public', 'collection', 'created_at', 'updated_at', 'order']
+class PostItemSerializer(serializers.ModelSerializer):
+    """Serializes a post item with its linked content"""
+    content_type = serializers.SerializerMethodField()
+    content = serializers.SerializerMethodField()
 
-# Similar updates for Transportation, Visit, Lodging, Checklist serializers
+    class Meta:
+        model = PostItem
+        fields = ['id', 'order', 'content_type', 'content']
+
+    def get_content_type(self, obj):
+        """Return content type name"""
+        return obj.content_type.model
+
+    def get_content(self, obj):
+        """Return serialized content object"""
+        content = obj.content_object
+        if isinstance(content, Note):
+            return NoteSerializer(content).data
+        elif isinstance(content, Visit):
+            return VisitSerializer(content).data
+        elif isinstance(content, Transportation):
+            return TransportationSerializer(content).data
+        elif isinstance(content, Lodging):
+            return LodgingSerializer(content).data
+        elif isinstance(content, Checklist):
+            return ChecklistSerializer(content).data
+        return None
+
+
+class PostSerializer(serializers.ModelSerializer):
+    """Serializes a blog post with all its items"""
+    items = PostItemSerializer(many=True, read_only=True)
+    hero_image_url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Post
+        fields = ['id', 'collection', 'user', 'title', 'slug', 'start_date',
+                 'end_date', 'hero_image', 'hero_image_url', 'is_published',
+                 'order', 'items', 'created_at', 'updated_at']
+        read_only_fields = ['slug']
+
+    def get_hero_image_url(self, obj):
+        if obj.hero_image:
+            return obj.hero_image.image.url
+        return None
+
+
+class CollectionWithPostsSerializer(serializers.ModelSerializer):
+    """Serializes a collection with all its posts"""
+    posts = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Collection
+        fields = ['id', 'name', 'description', 'start_date', 'end_date',
+                 'is_public', 'posts', 'created_at', 'updated_at']
+
+    def get_posts(self, obj):
+        """Return only published posts for public sharing"""
+        posts = obj.posts.filter(is_published=True).order_by('order')
+        return PostSerializer(posts, many=True).data
 ```
 
-### Post Construction Algorithm
+### API Endpoints
 
+**New Endpoints:**
+```python
+# GET /api/collections/{id}/posts/
+# Returns all posts in a collection (filtered by is_published for non-owners)
+
+# POST /api/collections/{id}/posts/
+# Create a new post
+
+# GET /api/posts/{id}/
+# Get a specific post with all its items
+
+# PATCH /api/posts/{id}/
+# Update post metadata (title, dates, hero_image, is_published)
+
+# DELETE /api/posts/{id}/
+# Delete a post
+
+# POST /api/posts/{id}/items/
+# Add content items to post
+# Body: [{ content_type: 'note', object_id: 'uuid', order: 1 }, ...]
+
+# PATCH /api/posts/{id}/items/reorder/
+# Reorder items within post
+# Body: [{ id: 'post_item_id', order: 1 }, ...]
+
+# DELETE /api/posts/{post_id}/items/{item_id}/
+# Remove content item from post
+```
+
+### Frontend Data Flow
+
+**TypeScript Interfaces:**
 ```typescript
-interface ContentItem {
-  type: 'note' | 'location' | 'transportation' | 'lodging' | 'checklist';
-  data: Note | Location | Transportation | Lodging | Checklist;
-  order: number | null;
-  date: Date;
-}
-
 interface Post {
   id: string;
-  title: string;              // From first Note in post
-  startDate: Date;           // From earliest content date
-  endDate: Date;             // From latest content date
-  heroImage: Image | null;   // From first Note's images or first location image
-  items: ContentItem[];      // Ordered array of all content (notes, locations, etc.)
+  collection: string;
+  user: string;
+  title: string;
+  slug: string;
+  start_date: string;
+  end_date: string | null;
+  hero_image: string | null;
+  hero_image_url: string | null;
+  is_published: boolean;
+  order: number;
+  items: PostItem[];
+  created_at: string;
+  updated_at: string;
 }
 
-function buildPostsFromCollection(collection: Collection): Post[] {
-  // 1. Gather all content items with order field
-  const allItems: ContentItem[] = [
-    ...collection.notes.map(n => ({
-      type: 'note' as const,
-      data: n,
-      order: n.order,
-      date: n.date
-    })),
-    ...collection.locations.flatMap(loc =>
-      loc.visits.map(v => ({
-        type: 'location' as const,
-        data: { ...loc, visit: v },  // Include visit timestamp
-        order: v.order,
-        date: v.start_date
-      }))
-    ),
-    ...collection.transportations.map(t => ({
-      type: 'transportation' as const,
-      data: t,
-      order: t.order,
-      date: t.date
-    })),
-    ...collection.lodging.map(l => ({
-      type: 'lodging' as const,
-      data: l,
-      order: l.order,
-      date: l.check_in
-    })),
-    ...collection.checklists.map(c => ({
-      type: 'checklist' as const,
-      data: c,
-      order: c.order,
-      date: c.date
-    }))
-  ];
+interface PostItem {
+  id: string;
+  order: number;
+  content_type: 'note' | 'visit' | 'transportation' | 'lodging' | 'checklist';
+  content: Note | Visit | Transportation | Lodging | Checklist;
+}
 
-  // 2. Sort by order (if set), then by date
-  allItems.sort((a, b) => {
-    // If both have order, sort by order
-    if (a.order !== null && b.order !== null) {
-      return a.order - b.order;
-    }
-    // If only one has order, prioritize it
-    if (a.order !== null) return -1;
-    if (b.order !== null) return 1;
-    // If neither has order, sort by date
-    return a.date.getTime() - b.date.getTime();
-  });
-
-  // 3. Group items into posts based on date proximity or explicit ordering
-  const posts: Post[] = [];
-  let currentPost: ContentItem[] = [];
-  let currentPostStartDate: Date | null = null;
-
-  allItems.forEach((item, index) => {
-    const nextItem = allItems[index + 1];
-
-    if (!currentPostStartDate) {
-      currentPostStartDate = item.date;
-    }
-
-    currentPost.push(item);
-
-    // Determine if this ends the current post:
-    // 1. Next item is a Note (Notes start new posts)
-    // 2. Gap of 2+ days to next item
-    // 3. This is the last item
-    const isNextNote = nextItem?.type === 'note';
-    const dayGap = nextItem
-      ? Math.abs(daysBetween(item.date, nextItem.date))
-      : Infinity;
-    const isLastItem = !nextItem;
-
-    if (isNextNote || dayGap >= 2 || isLastItem) {
-      // Find first note in post for title
-      const firstNote = currentPost.find(i => i.type === 'note');
-
-      if (firstNote) {  // Only create post if it has at least one Note
-        const postDates = currentPost.map(i => i.date);
-        const startDate = new Date(Math.min(...postDates.map(d => d.getTime())));
-        const endDate = new Date(Math.max(...postDates.map(d => d.getTime())));
-
-        // Gather all photos from post items
-        const allPhotos = currentPost.flatMap(item => {
-          if (item.data.images) return item.data.images;
-          if (item.data.attachments) return item.data.attachments;
-          return [];
-        });
-
-        posts.push({
-          id: firstNote.data.id,
-          title: (firstNote.data as Note).name,
-          startDate,
-          endDate,
-          heroImage: allPhotos[0] || null,
-          items: currentPost
-        });
-      }
-
-      currentPost = [];
-      currentPostStartDate = null;
-    }
-  });
-
-  return posts;
+interface CollectionWithPosts {
+  id: string;
+  name: string;
+  description: string;
+  start_date: string;
+  end_date: string;
+  is_public: boolean;
+  posts: Post[];
 }
 ```
 
-### Post Grouping Logic
+**Fetching Data:**
+```typescript
+// In +page.server.ts
+export async function load({ params }) {
+  const response = await fetch(
+    `${API_URL}/api/collections/${params.id}/posts/`
+  );
+  const posts: Post[] = await response.json();
 
-**How Content Gets Grouped into Posts:**
-
-1. **Notes trigger new posts** - Each Note starts a new blog post
-2. **Content follows until next Note** - All Locations, Transportation, Lodging between Notes belong to the post
-3. **Date proximity groups orphans** - Content without nearby Notes groups by 2-day gaps
-4. **Manual ordering overrides** - Setting `order` field explicitly sequences content
-
-**Example Timeline:**
+  return {
+    collection: {
+      /* ... */
+    },
+    posts
+  };
+}
 ```
-Order: 1  | Note 1 (Jan 4): "Arrival in Granada"     ← Post 1 starts
-Order: 2  | Location (Jan 4): Albaicín neighborhood  ← Part of Post 1
-Order: 3  | Note 2 (Jan 4): "Evening walk"           ← Still Post 1 (same day)
-Order: 4  | Location (Jan 5): Alhambra               ← Part of Post 1
-Order: 5  | Transportation (Jan 5): Train            ← Part of Post 1
-Order: 10 | Note 3 (Jan 7): "Day trip"               ← Post 2 starts (new Note)
-Order: 11 | Location (Jan 7): Sierra Nevada          ← Part of Post 2
-```
-
-### Content Ordering Within Posts
-
-**Ordering Priority:**
-1. **Manual `order` field** (if set) - User has explicitly sequenced
-2. **Chronological by date** (fallback) - Natural time order
-3. **Type-based** (last resort) - Notes → Locations → Transportation → Lodging
-
-**Setting Order:**
-- Initially: `order` is `null` for all items → chronological sorting
-- User can drag-and-drop in AdventureLog UI to set explicit order
-- Order values can have gaps (10, 20, 30...) to allow easy insertion
 
 ### Multi-Day Post Example
 
 **Scenario:** 3-day Granada visit with flexible content ordering
 
-**User Creates in AdventureLog:**
+**Step 1: User Creates Content in AdventureLog**
 ```
-Note 1 (Jan 4):
-  Title: "Three Days in Granada"
-  Content: "Our Granada adventure started with a long drive from the Netherlands..."
-  Date: 2026-01-04
-  Order: 1
+Collection: "Sabbatical 2026"
 
-Transportation (Jan 2-4):
-  Type: Car
-  From: Netherlands → Granada
-  Distance: 1,746 km
-  Order: 2  ← User dragged this to appear after first note
+Note 1: "Three Days in Granada"
+  Content: "Our Granada adventure started..."
+  Date: Jan 4, 2026
 
-Note 2 (Jan 4):
-  Title: "Exploring Albaicín"
-  Content: "First evening we wandered through the narrow streets..."
-  Date: 2026-01-04
-  Order: 3
+Note 2: "Exploring Albaicín"
+  Content: "First evening we wandered..."
+  Date: Jan 4, 2026
 
-Location (Jan 4):
-  Name: Albaicín neighborhood
+Note 3: "The Alhambra"
+  Content: "Day 2 we visited the palace..."
+  Date: Jan 5, 2026
+
+Note 4: "Sunset Viewpoints"
+  Content: "Last day was more relaxed..."
+  Date: Jan 6, 2026
+
+Location: Albaicín neighborhood
   Visit: Jan 4, 3pm-7pm
-  Order: 4  ← Appears after the note about Albaicín
 
-Note 3 (Jan 5):
-  Title: "The Alhambra"
-  Content: "Day 2 we finally visited the palace. It was stunning!"
-  Date: 2026-01-05
-  Order: 5
-
-Location (Jan 5):
-  Name: Alhambra
+Location: Alhambra
   Visit: Jan 5, 10am-2pm
-  Order: 6
 
-Note 4 (Jan 6):
-  Title: "Sunset Viewpoints"
-  Content: "Last day was more relaxed with sunset at Mirador..."
-  Date: 2026-01-06
-  Order: 7
-
-Location (Jan 6):
-  Name: Mirador de San Nicolás
+Location: Mirador de San Nicolás
   Visit: Jan 6, 5pm-7pm
-  Order: 8
 
-Lodging (Jan 4-7):
-  Name: Hotel Casa del Capitel Nazarí
-  Check-in: Jan 4
-  Order: null  ← No explicit order, appears at end
+Transportation: Car
+  Netherlands → Granada
+  Jan 2-4, 2026
+
+Lodging: Hotel Casa del Capitel Nazarí
+  Jan 4-7, 2026
 ```
 
-**Blog View Displays:**
+**Step 2: User Creates a Post**
 ```
+Click "Create Blog Post" in Collection view
+
+Post Form:
+  Title: "Three Days in Granada"
+  Start Date: Jan 4, 2026
+  End Date: Jan 6, 2026
+  Hero Image: [Select from Alhambra photos]
+  Status: Published
+```
+
+**Step 3: User Adds Content to Post (Drag & Drop)**
+```
+Available Content (Jan 4-6):    →    Post Items:
+□ Note 1: "Three Days..."            ☰ [1] Note: "Three Days..."
+□ Note 2: "Exploring..."             ☰ [2] Transportation: Car
+□ Note 3: "The Alhambra"             ☰ [3] Note: "Exploring..."
+□ Note 4: "Sunset..."                ☰ [4] Location: Albaicín
+□ Location: Albaicín                 ☰ [5] Note: "The Alhambra"
+□ Location: Alhambra                 ☰ [6] Location: Alhambra
+□ Location: Mirador                  ☰ [7] Note: "Sunset..."
+□ Transportation: Car                ☰ [8] Location: Mirador
+□ Lodging: Hotel                     ☰ [9] Lodging: Hotel
+```
+
+**Step 4: Blog View Displays**
+```
+URL: /share/sabbatical-2026/three-days-in-granada
+
 Post: "Three Days in Granada"
 Date Range: Jan 4-6, 2026 (3 days)
 
@@ -416,50 +481,96 @@ Last day was more relaxed with sunset at Mirador...
 [Lodging photos]
 
 [Map showing all locations]
+
+← Previous Post    |    Next Post →
 ```
 
 **Key Points:**
-- Multiple Notes within same post create sections
-- Content interleaved based on `order` field
-- Transportation appears after relevant note (not at end)
-- Natural narrative flow with text → photos → text → photos
-- Lodging without order appears at end
+- Post is created explicitly, not automatically
+- User decides title, date range, and what content to include
+- Content can be reordered by dragging within post
+- Same content can appear in multiple posts (e.g., hotel spans multiple posts)
+- Natural narrative flow: text → journey → text → location → text → location
 
-### Benefits of This Approach
+### Benefits of Explicit Post Model
 
-✅ **Full manual control** - Drag-and-drop any content in any order
-✅ **Flexible post length** - Can be 1 day or many days
-✅ **Natural authoring** - Write Notes as you go, content groups automatically
+✅ **Clear ownership** - Content explicitly belongs to posts
+✅ **Full manual control** - Drag-and-drop any content in any order within post
+✅ **Flexible post length** - Can be 1 day or many days (you decide)
+✅ **Content reuse** - Same location can appear in multiple posts
 ✅ **Mixed content** - Interleave notes, locations, photos, transportation
 ✅ **Blog-like flow** - Text → photo → text → map → text (any sequence)
-✅ **Chronological fallback** - Works without setting order (uses dates)
-✅ **Minimal backend change** - Just one integer field per model
-✅ **Future-proof** - Can extend with post templates, auto-ordering, etc.
+✅ **Draft/publish workflow** - Posts can be drafts before publishing
+✅ **No automatic grouping** - No confusing rules, you create posts explicitly
+✅ **Clean URLs** - `/share/trip-name/post-slug` (SEO-friendly)
+✅ **First-class entity** - Posts are database models, not virtual constructs
 
 ---
 
 ## 🗺️ User Experience Flow
 
 ### For Content Creator (You)
-1. Use existing AdventureLog interface to add locations, photos, notes, transportation
-2. Mark collection as `is_public = true`
-3. Click "Share as Story" button in collection management page
-4. Copy secret share link: `https://yourserver.com/share/abc123def456`
-5. Send link to family/friends
+
+**Phase 1: Create Content** (as you travel)
+1. Use existing AdventureLog interface to add:
+   - Notes with markdown stories
+   - Locations with photos
+   - Transportation details
+   - Lodging information
+2. This works exactly as before - no change to existing workflow
+
+**Phase 2: Create Blog Posts** (weekly or after trip)
+1. Go to Collection page
+2. Click "Create Blog Post" button
+3. Fill in post form:
+   - Title: "Three Days in Granada"
+   - Date range: Jan 4-6, 2026
+   - Select hero image
+   - Status: Draft or Published
+4. Drag content items into post in desired order
+5. Preview blog view
+6. Publish post
+
+**Phase 3: Share Sabbatical** (once)
+1. Mark collection as `is_public = true`
+2. Click "Share Sabbatical" button
+3. Copy share link: `https://yourserver.com/share/sabbatical-2026`
+4. Send link to family/friends
 
 ### For Viewers (Family/Friends)
-1. Open shared link → lands on trip overview page
-2. See trip summary: hero photo, title, date range, total days
-3. Navigate to days via:
-   - Day dropdown selector
-   - Previous/Next buttons
-   - Timeline/progress visualization
-4. Browser remembers last viewed day (localStorage)
-5. On return visit:
-   - Opens last viewed day by default
-   - Shows badge if new days were added: "New: Day 15-17"
-6. Can view full map of entire trip
-7. Can navigate entire story chronologically
+
+**First Visit:**
+1. Open share link: `https://yourserver.com/share/sabbatical-2026`
+2. See trip overview page:
+   - Hero image
+   - Trip title: "Sabbatical 2026"
+   - Date range: Jan 2 - June 15, 2026
+   - Grid of all published posts with preview cards
+3. Click a post to read it
+4. Navigate between posts with Previous/Next buttons
+
+**Reading a Post:**
+1. See post title and date range
+2. View hero image
+3. Scroll through mixed content:
+   - Notes (text sections)
+   - Photos (galleries)
+   - Locations (with details and maps)
+   - Transportation (journey cards)
+4. Map at bottom shows all locations in post
+5. Navigate to next post or back to trip overview
+
+**Return Visits:**
+1. Browser remembers last viewed post (localStorage)
+2. Landing page shows "Continue Reading: Post 5"
+3. Badge shows "New: 3 posts added"
+4. Can jump to specific post from overview
+
+**Navigation Options:**
+- Trip overview grid (see all posts)
+- Previous/Next buttons (sequential reading)
+- Progress indicator: "Post 3 of 25"
+- Full trip map (all locations from all posts)
 
 ---
 
