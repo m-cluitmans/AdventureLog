@@ -13,7 +13,7 @@ Create a parallel blog-style view for AdventureLog collections that presents tra
 ### Key Requirements
 1. **Keep existing AdventureLog UI** - Maintain current data management interface
 2. **Add new blog view** - Create public-facing story presentation
-3. **Paginated navigation** - Handle long trips (14 weeks) with day-by-day or post-by-post (where a post can contain multiple elements, such as locations, transportation, markdown note, etc) pagination
+3. **Paginated navigation** - Handle long trips (14 weeks) with post-by-post (where a post can contain multiple elements, such as locations, transportation, markdown note, etc) pagination
 4. **Smart navigation** - Remember viewer's last position, highlight new content
 5. **Full-width media** - Hero images and photo galleries for visual storytelling
 6. **Secret public URLs** - Shareable links not indexed by search engines
